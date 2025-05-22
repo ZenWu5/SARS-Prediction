@@ -1,0 +1,13 @@
+model_training.zip
+data/weights/
+.idea
+preprocess/ESM/output/
+preprocess/mut2seq/output/
+preprocess/seqsample/output/
+/preprocess/embedding/output/
+preprocess/merged_variant_output.csv
+preprocess/merged_variant_output_bk.csv
+TrainingFiles/
+ModelResults/
+single_train/eval/
+
