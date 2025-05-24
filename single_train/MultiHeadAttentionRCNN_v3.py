@@ -155,25 +155,33 @@ class MultiHeadAttentionRCNN(nn.Module):
 class H5ProteinDataset(Dataset):
     def __init__(self, h5_path, max_seq_len=None, normalize=True, debug=False, debug_sample=100):
         """
-        按需从 HDF5 文件加载单条样本。仅支持数据结构（embeddings, mean_log10Ka, diff_count）
+        一次性将所有数据加载到内存。仅支持数据结构（embeddings, mean_log10Ka, diff_count）
         """
         self.h5_path = h5_path if h5_path.endswith('.h5') else h5_path + '.h5'
+                
+        # 导入数据到内存
+        if not os.path.exists(self.h5_path):
+            raise FileNotFoundError(f"数据文件 '{self.h5_path}' 不存在，请检查路径是否正确。")
         with h5py.File(self.h5_path, 'r') as f:
-            self.total = int(f.attrs['total_samples'])
-            self.emb_dim = int(f.attrs['embedding_dim'])
-            # 只加载目标和diff_count
-            self.targets = f['mean_log10Ka'][:].astype(np.float32)      # (N,)
-            self.diff_counts = f['diff_count'][:].astype(np.int16)       # (N,)
-            # 统计所有序列长度
-            self.seq_lengths = np.array([f['embeddings'][f'emb_{i}'].shape[0] for i in range(self.total)], dtype=np.int32)
+            self.targets = f['mean_log10Ka'][:].astype(np.float32)  # (N,)
+            self.diff_counts = f['diff_count'][:].astype(np.int16)  # (N,)
+            # 一次性全部加载到内存
+            self.embeddings = [f['embeddings'][f'emb_{i}'][:] for i in range(int(f.attrs['total_samples']))]
+
+        # 处理数据
+        self.total = len(self.targets)
+        self.emb_dim = self.embeddings[0].shape[1]  # 假设所有嵌入向量的维度相同
+        self.seq_lengths = np.array([emb.shape[0] for emb in self.embeddings], dtype=np.int32)
+
+        # debug模式下减少样本数量
         if debug:
             self.total = min(debug_sample, self.total)
             self.targets = self.targets[:self.total]
             self.diff_counts = self.diff_counts[:self.total]
+            self.embeddings = self.embeddings[:self.total]
             self.seq_lengths = self.seq_lengths[:self.total]
-        self.max_seq_len = max_seq_len or int(self.seq_lengths.max())
-        self._file = None
 
+        self.max_seq_len = max_seq_len or int(self.seq_lengths.max())
         self.normalize = normalize
         self.feature_mean = None
         self.feature_std = None
@@ -181,23 +189,11 @@ class H5ProteinDataset(Dataset):
         if normalize:
             self._compute_normalization_stats()
 
-    def __getstate__(self):
-        # 在 worker 进程间传递时，不传递已打开的文件句柄
-        state = self.__dict__.copy()
-        state['_file'] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._file = None  # worker 初始化时重新打开文件
-
     def __len__(self):
         return self.total
 
     def __getitem__(self, idx):
-        if self._file is None:
-            self._file = h5py.File(self.h5_path, 'r', swmr=True)
-        emb = self._file['embeddings'][f'emb_{idx}'][:].astype(np.float32)  # (L, D)
+        emb = self.embeddings[idx].astype(np.float32)  # (L, D)
         if self.normalize and self.feature_mean is not None:
             emb = (emb - self.feature_mean) / self.feature_std
         L = emb.shape[0]
@@ -223,10 +219,9 @@ class H5ProteinDataset(Dataset):
         n_samples = min(1000, self.total)
         indices = np.random.choice(self.total, n_samples, replace=False)
         all_features = []
-        with h5py.File(self.h5_path, 'r') as f:
-            for idx in tqdm(indices, desc="采样特征统计"):
-                emb = f['embeddings'][f'emb_{idx}'][:].astype(np.float32)
-                all_features.append(emb)
+        for idx in tqdm(indices, desc="采样特征统计"):
+            emb = self.embeddings[idx].astype(np.float32)
+            all_features.append(emb)
         all_features = np.vstack(all_features)
         self.feature_mean = np.mean(all_features, axis=0)
         self.feature_std = np.std(all_features, axis=0) + 1e-8
@@ -632,17 +627,17 @@ def main():
             Subset(train_val_set, train_subidx),
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=8,
+            num_workers=0,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=False
         )
         val_loader = DataLoader(
             Subset(train_val_set, val_subidx),
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=2,
+            num_workers=0,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=False
         )
 
         # 训练并验证
@@ -681,9 +676,9 @@ def main():
         test_set,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=False
     )
     evaluate_model(best_model, test_loader, output_dir)
 

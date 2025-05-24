@@ -13,7 +13,7 @@ from scipy.stats import pearsonr
 from sklearn.svm import SVR
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neighbors import KNeighborsRegressor
-from sklearn.naive_bayes import GaussianNB
+from sklearn.linear_model import BayesianRidge
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 from matplotlib.font_manager import FontProperties
@@ -62,7 +62,7 @@ class H5FeatureProcessor:
             # 计算序列长度
             self.seq_lengths = np.array([f['embeddings'][f'emb_{i}'].shape[0] for i in range(self.total)], dtype=np.int32)
 
-    def extract_features(self, normalize=True, max_samples=None):
+    def extract_features(self, normalize=True, max_samples=10000):
         n_samples = min(self.total, max_samples) if max_samples else self.total
         X = np.zeros((n_samples, self.emb_dim), dtype=np.float32)
 
@@ -97,10 +97,10 @@ class H5FeatureProcessor:
 def create_baseline_models():
     """创建基线模型字典"""
     models = {
-        # 'svm': SVR(kernel='rbf', gamma='scale', C=1.0, epsilon=0.1),
+        'svm': SVR(kernel='rbf', gamma='scale', C=1.0, epsilon=0.1),
         'rf': RandomForestRegressor(n_estimators=100, max_depth=None, random_state=args.seed),
         'knn': KNeighborsRegressor(n_neighbors=5, weights='distance'),
-        'bayes': GaussianNB(),  # 朴素贝叶斯
+        'bayes': BayesianRidge(),  # 朴素贝叶斯
         'lr': LinearRegression()  # 线性回归
     }
     return models
