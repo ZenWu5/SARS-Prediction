@@ -510,16 +510,16 @@ def evaluate_model(model, test_loader, output_dir=None):
     # 收集预测和真实值
     test_preds = []
     test_targets = []
-    test_attentions = []
-    
+    # test_attentions = [] # 暂时不需要收集注意力，如果需要可视化再考虑
+
     for X_batch, mask_batch, y_batch in test_loader:
         X_batch = X_batch.to(device)
         mask_batch = mask_batch.to(device)
         
         with torch.no_grad():
-            pred, attention = model(X_batch, mask_batch)
+            pred, _ = model(X_batch, mask_batch) # 不再接收 attention，因为这里不需要处理它来计算指标
             test_preds.append(pred.cpu().numpy())
-            test_attentions.append(attention.cpu().numpy())
+            # test_attentions.append(attention.cpu().numpy()) # 如果需要可视化注意力，这里保留
             test_targets.append(y_batch.numpy())
     
     # 合并批次结果
@@ -565,7 +565,9 @@ def evaluate_model(model, test_loader, output_dir=None):
         fig_output_path = os.path.join(output_dir, f'mhrcnn_predictions_{figtime}.png')
         plt.savefig(fig_output_path)
         logger.info(f"预测结果可视化已保存至 '{fig_output_path}'")
+    plt.close() # 关闭图形，防止内存占用过高
 
+    # 返回所有指标
     return test_mse, test_mae, test_r2, test_pearson
 
 # 主函数
@@ -620,10 +622,11 @@ def main():
 
     # 7. K 折交叉验证
     kf = KFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
-    best_model_state = []
+    best_model_state_dicts = [] # 存储 state_dict，而不是直接的模型引用
     fold_results = []
     all_histories = []
-    best_model, best_mse, best_fold = None, float('inf'), None
+    best_val_mse = float('inf')
+    best_fold_idx = None # 存储最佳折叠的索引
 
     for fold, (train_subidx, val_subidx) in enumerate(kf.split(train_val_idx), 1):
         logger.info(f"\n======= 第 {fold}/{args.k_folds} 折 =======")
@@ -646,31 +649,51 @@ def main():
         )
 
         # 训练并验证
-        model, val_res, history = train_model(
+        current_model, val_res, history = train_model( # 使用一个临时变量来表示当前模型
             train_loader, val_loader,
             model_params, training_params
         )
         fold_results.append(val_res)
         all_histories.append(history)
-        best_model_state.append(model.state_dict().copy())
+        best_model_state_dicts.append(current_model.state_dict()) # 保存当前折叠最佳模型的 state_dict
 
         logger.info(f"第 {fold} 折 验证 MSE={val_res['mse']:.6f}")
 
-        if val_res['mse'] < best_mse:
-            best_mse = val_res['mse']
-            best_model = model
-            best_fold = fold - 1  # 索引从0开始
+        if val_res['mse'] < best_val_mse:
+            best_val_mse = val_res['mse']
+            best_fold_idx = fold - 1 # 存储 0-based 的折叠编号
+            logger.info(f"更新最佳模型为第 {fold} 折 (MSE: {best_val_mse:.6f})")
 
-        # 清理显存
+        # 清理 GPU 内存
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # 加载最佳折权重
-    best_model.load_state_dict(best_model_state[best_fold])
+    # K 折循环结束后，加载真正表现最佳的折叠的 state_dict
+    if best_fold_idx is not None:
+        # 使用相同的参数重新初始化模型
+        # 您需要为模型初始化获取 input_dim。
+        # 这已经在 train_model 中处理，但为了加载，
+        # 我们可以从数据集中获取或从一个虚拟批次中重新获取。
+        for x_batch, _, _ in train_loader: # 使用现有的任一 loader 获取 input_dim
+            input_dim = x_batch.shape[2]
+            break
+        
+        final_best_model = MultiHeadAttentionRCNN(
+            input_dim=input_dim,
+            hidden_dim=model_params['hidden_dim'],
+            num_layers=model_params['num_layers'],
+            dropout=model_params['dropout']
+        ).to(device)
+        
+        final_best_model.load_state_dict(best_model_state_dicts[best_fold_idx])
+        logger.info(f"已加载最佳模型（第 {best_fold_idx + 1} 折）的权重用于最终评估。")
+    else:
+        logger.error("没有找到最佳折叠模型。")
+        return # 或者进行适当的错误处理
 
-    # 8. 保存训练历史可视化
-    history_fig = plot_training_history(all_histories, best_fold)
+    # 8. 保存训练历史可视化 (best_fold_idx 已经是 plot_training_history 的 0-indexed 参数)
+    history_fig = plot_training_history(all_histories, best_fold=best_fold_idx)
     history_path = os.path.join(output_dir, f'history_{timestamp}.png')
     history_fig.savefig(history_path)
     logger.info(f"训练历史图已保存至: {history_path}")
@@ -685,11 +708,11 @@ def main():
         pin_memory=True,
         persistent_workers=True
     )
-    evaluate_model(best_model, test_loader, output_dir)
+    evaluate_model(final_best_model, test_loader, output_dir) # 使用 final_best_model
 
     # 10. 可视化部分测试样本的注意力权重
     att_fig = visualize_attention(
-        best_model, test_loader,
+        final_best_model, test_loader, # 使用 final_best_model
         n_samples=5
     )
     att_path = os.path.join(output_dir, f'attention_{timestamp}.png')
@@ -700,13 +723,12 @@ def main():
     # 11. 保存模型与结果摘要
     model_path = os.path.join(output_dir, 'best_model.pt')
     torch.save({
-        'model_state_dict': best_model.state_dict(),
+        'model_state_dict': final_best_model.state_dict(), # 保存 final_best_model 的 state_dict
         'model_params': model_params
     }, model_path)
     logger.info(f"最佳模型已保存至: {model_path}")
 
     summary_path = os.path.join(output_dir, f'results_summary_{timestamp}.txt')
-    # 写入摘要，包括输入参数和每折详细结果
     with open(summary_path, 'w', encoding='utf-8') as f:
         f.write("======= 多头注意力RCNN 训练结果摘要 =======\n")
         f.write("【输入参数】\n")
@@ -714,8 +736,8 @@ def main():
             f.write(f"{arg}: {value}\n")
         f.write("\n")
         f.write("【模型结果】\n")
-        f.write(f"最佳折: {best_fold + 1}/{args.k_folds}\n")
-        f.write(f"测试集 MSE: {best_mse:.6f}\n")
+        f.write(f"最佳折: {best_fold_idx + 1}/{args.k_folds}\n") # 使用 best_fold_idx
+        f.write(f"验证集 MSE: {best_val_mse:.6f}\n") # 这是最佳验证集的 MSE，不是测试集 MSE。
         f.write("\n【各折最终结果】\n")
         for i, res in enumerate(fold_results):
             f.write(
